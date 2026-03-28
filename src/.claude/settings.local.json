@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/jeonjaehyeon/Desktop/개발/projects/ai_project/ai_poc/ag_ui -type f -name *.toml -o -name *.txt -o -name package.json -o -name *.json -o -name *.yaml -o -name *.yml)",
+      "Bash(find /Users/jeonjaehyeon/Desktop/개발/projects/ai_project/ai_poc -type f \\\\\\(-name *.py -o -name *.js -o -name *.ts -o -name *.tsx -o -name *.jsx \\\\\\))",
+      "Bash(find /Users/jeonjaehyeon/Desktop/개발/projects/ai_project/langgraph_tutorial -maxdepth 2 -type f \\\\\\(-name *.py -o -name *.toml -o -name *.txt \\\\\\))",
+      "Bash(find /Users/jeonjaehyeon/Desktop/개발/projects/ai_project/ai_poc -type f -name *.py -o -name *.toml -o -name *.json)",
+      "WebSearch",
+      "WebFetch(domain:docs.ag-ui.com)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:www.npmjs.com)",
+      "Bash(uv add:*)",
+      "Bash(python -c \"import ag_ui.core; print\\(dir\\(ag_ui.core\\)\\)\")",
+      "Bash(uv run:*)",
+      "Bash(cd:*)"
+    ]
+  }
+}
