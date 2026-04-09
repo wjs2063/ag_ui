@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"a2a\\\\|protocol\\\\|enqueue\" /Users/jeonjaehyeon/Desktop/개발/projects/ai_project/ai_poc --include=*.py)",
+      "Bash(python3 -c \"import ag_ui.core; import inspect; print\\([m for m in dir\\(ag_ui.core\\) if not m.startswith\\(''_''\\)]\\)\")",
+      "Bash(grep -r \"asyncio.Queue\\\\|asyncio.Task\\\\|BackgroundTask\\\\|task\\\\|queue\" /Users/jeonjaehyeon/Desktop/개발/projects/ai_project/a2a_protocol/mcp_as_tool --include=*.py)",
+      "Bash(grep -r \"enqueue_event\\\\|enqueue\" /Users/jeonjaehyeon/Desktop/개발/projects/ai_project/a2a_protocol/.venv/lib/python3.13/site-packages/a2a --include=*.py)",
+      "Bash(python3 -c \"from a2a import *; print\\([x for x in dir\\(\\) if ''enqueue'' in x.lower\\(\\)]\\)\")",
+      "Bash(find /Users/jeonjaehyeon/Desktop/개발/projects/ai_project/ai_poc/src -name \"*.py\" -type f -exec wc -l {})",
+      "Bash(sort -k2 -rn)"
+    ]
+  }
+}

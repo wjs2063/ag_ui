@@ -1,11 +1,29 @@
-from fastapi import FastAPI
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from src.event_queue import EventQueue
 from src.stream import run_workflow_stream
 
-app = FastAPI(title="AG-UI LangGraph POC")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    event_queue = EventQueue(maxsize=1000, num_workers=1)
+    await event_queue.start()
+    app.state.event_queue = event_queue
+    yield
+    await event_queue.shutdown(timeout=10.0)
+
+
+app = FastAPI(title="AG-UI LangGraph POC", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,6 +51,34 @@ async def run_agent(req: RunRequest):
     )
 
 
+class DelayedInsertRequest(BaseModel):
+    data: dict
+
+
+@app.post("/enqueue-delayed-insert")
+async def enqueue_delayed_insert(
+    req: DelayedInsertRequest,
+    request: Request,
+):
+    eq: EventQueue = request.app.state.event_queue
+    payload = req.data
+
+    async def delayed_insert() -> None:
+        await asyncio.sleep(3)
+        # TODO: 실제 DB 연결로 교체
+        logger.info("DB INSERT: %s", payload)
+
+    ok = await eq.enqueue(delayed_insert)
+    if not ok:
+        return {"status": "error", "message": "queue full or not running"}
+    return {"status": "enqueued", "pending": eq.pending}
+
+
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health(request: Request):
+    eq: EventQueue = request.app.state.event_queue
+    return {
+        "status": "ok",
+        "queue_pending": eq.pending,
+        "queue_maxsize": eq.maxsize,
+    }
