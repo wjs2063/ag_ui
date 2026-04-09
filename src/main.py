@@ -80,5 +80,6 @@ async def health(request: Request):
     return {
         "status": "ok",
         "queue_pending": eq.pending,
+        "queue_active": eq.active_count,
         "queue_maxsize": eq.maxsize,
     }

@@ -18,6 +18,7 @@ class EventQueue:
         self._num_workers = num_workers
         self._workers: list[asyncio.Task] = []
         self._running = False
+        self._active_tasks: list[int] = [0]
 
     async def start(self) -> None:
         if self._running:
@@ -25,7 +26,7 @@ class EventQueue:
         self._running = True
         for i in range(self._num_workers):
             task = asyncio.create_task(
-                run_worker(self._queue, i),
+                run_worker(self._queue, i, self._active_tasks),
                 name=f"event-queue-worker-{i}",
             )
             self._workers.append(task)
@@ -53,14 +54,38 @@ class EventQueue:
             return
         self._running = False
 
-        for _ in self._workers:
-            try:
-                self._queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+        # Phase 1: drain — 큐의 모든 Task 처리 대기
+        drain_timeout = timeout * 0.6
+        try:
+            await asyncio.wait_for(
+                self._queue.join(), timeout=drain_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Drain timed out after %.1fs, %d tasks pending",
+                drain_timeout,
+                self._queue.qsize(),
+            )
 
+        # drain 실패 시 남은 Task 제거 및 로깅
+        dropped = 0
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        if dropped:
+            logger.warning("Dropped %d undrained tasks", dropped)
+
+        # Phase 2: sentinel 전송 후 워커 종료
+        for _ in self._workers:
+            await self._queue.put(None)
+
+        stop_timeout = timeout * 0.4
         done, pending = await asyncio.wait(
-            self._workers, timeout=timeout,
+            self._workers, timeout=stop_timeout,
         )
         for task in pending:
             task.cancel()
@@ -70,19 +95,15 @@ class EventQueue:
                 pass
 
         self._workers.clear()
-
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except asyncio.QueueEmpty:
-                break
-
         logger.info("EventQueue shut down")
 
     @property
     def pending(self) -> int:
         return self._queue.qsize()
+
+    @property
+    def active_count(self) -> int:
+        return self._active_tasks[0]
 
     @property
     def maxsize(self) -> int:
