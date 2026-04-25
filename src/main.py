@@ -8,6 +8,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.event_queue import EventQueue
+from src.memory.api import extract, feedback, graph, retrieve, turns
+from src.memory.layers.l1_store import L1Store
+from src.memory.layers.l2_store import L2Store
+from src.memory.layers.l3_store import L3Store
 from src.stream import run_workflow_stream
 
 logging.basicConfig(level=logging.INFO)
@@ -19,11 +23,24 @@ async def lifespan(app: FastAPI):
     event_queue = EventQueue(maxsize=1000, num_workers=1)
     await event_queue.start()
     app.state.event_queue = event_queue
+
+    l1 = L1Store()
+    await l1.ensure_indexes()
+    app.state.l1_store = l1
+    app.state.l2_store = L2Store()
+    app.state.l3_store = L3Store()
+
     yield
     await event_queue.shutdown(timeout=10.0)
 
 
 app = FastAPI(title="AG-UI LangGraph POC", lifespan=lifespan)
+
+app.include_router(turns.router, prefix="/memory", tags=["memory"])
+app.include_router(extract.router, prefix="/memory", tags=["memory"])
+app.include_router(retrieve.router, prefix="/memory", tags=["memory"])
+app.include_router(feedback.router, prefix="/memory", tags=["memory"])
+app.include_router(graph.router, prefix="/memory", tags=["memory"])
 
 app.add_middleware(
     CORSMiddleware,
