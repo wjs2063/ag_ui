@@ -4,7 +4,7 @@ import orjson
 from typing import Optional, Any, Dict, Tuple
 import socket
 from multidict import MultiMapping
-from .trace import create_trace_config
+from .trace import create_trace_config, TracingResolver
 
 class DetailedClientResponseError(ClientResponseError):
     """ClientResponseError + response_body (str, 500자 truncate)"""
@@ -49,6 +49,7 @@ class AioHttpClient(HTTPClientSessionInterface):
     async def initialize_session(self) -> ClientSession:
         """Lifespan 시작 시 호출: 세션 풀 생성"""
         connector = TCPConnector(
+            resolver=TracingResolver(),
             limit=200,
             limit_per_host=25,
             ttl_dns_cache=300,
@@ -75,7 +76,8 @@ class AioHttpClient(HTTPClientSessionInterface):
         # 기본 헤더 설정 (압축 전송 요청)
         headers = kwargs.pop("headers", {}) or {}
         headers.setdefault("Accept-Encoding", "gzip, deflate")
-        headers.setdefault("Content-Type", "application/json")
+        if method.upper() in ("POST", "PUT", "PATCH"):
+            headers.setdefault("Content-Type", "application/json")
 
         async with self._session.request(method, url, headers=headers, **kwargs) as response:
             try:
@@ -97,12 +99,12 @@ class AioHttpClient(HTTPClientSessionInterface):
                 return None
             return orjson.loads(raw_bytes)
 
-    async def get(self, url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[dict] = None) -> Optional[dict]:
-        return await self._request("GET", url, params=params, headers=headers)
+    async def get(self, url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[dict] = None, **kwargs) -> Optional[dict]:
+        return await self._request("GET", url, params=params, headers=headers, **kwargs)
 
-    async def post(self, url: str, json: Optional[Dict[str, Any]] = None, headers: Optional[dict] = None) -> Optional[dict]:
+    async def post(self, url: str, json: Optional[Dict[str, Any]] = None, headers: Optional[dict] = None, **kwargs) -> Optional[dict]:
         # aiohttp의 json= 파라미터는 위에서 설정한 json_serialize(orjson)를 사용함
-        return await self._request("POST", url, json=json, headers=headers)
+        return await self._request("POST", url, json=json, headers=headers, **kwargs)
 
 
 

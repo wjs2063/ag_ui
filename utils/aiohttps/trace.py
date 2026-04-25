@@ -1,5 +1,12 @@
+"""
+aiohttp TraceConfig — ContextVar + trace_request_ctx 기반 타이밍 수집.
+
+각 외부 API 호출마다 고유한 TraceRequestContext(ctx)가 생성되어,
+asyncio.gather() 병렬 호출에서도 콜백이 정확한 TraceRecord에 기록된다.
+"""
 import logging
-from typing import Any
+import socket
+from typing import Any, List
 from aiohttp import (
     TraceConfig,
     TraceRequestStartParams,
@@ -11,156 +18,234 @@ from aiohttp import (
     TraceRequestExceptionParams,
     ClientSession,
 )
+from aiohttp.resolver import DefaultResolver, ResolveResult
+from contextvars import ContextVar
+from .request_context import (
+    request_id_var,
+    trace_records_var,
+    TraceRecord,
+)
+
+# DNS 해석 결과를 콜백에 전달하기 위한 ContextVar
+# DefaultResolver.resolve() → 결과 저장 → on_dns_resolvehost_end 콜백에서 읽기
+_last_dns_result_var: ContextVar[list[str]] = ContextVar("_last_dns_result", default=[])
 
 logger = logging.getLogger("aiohttp.trace")
 
 
+class TracingResolver(DefaultResolver):
+    """
+    DefaultResolver를 래핑하여 DNS 해석 결과 IP를 ContextVar에 저장한다.
+
+    aiohttp 내부 흐름:
+        resolver.resolve(host, port)  ← 여기서 IP 확보 & ContextVar에 저장
+        → send_dns_resolvehost_end()  ← 콜백에서 ContextVar 읽어 TraceRecord에 기록
+
+    resolve() 결과는 aiohttp ResolveResult 리스트:
+        [{"hostname": "httpbin.org", "host": "3.228.76.52", "port": 443, ...}, ...]
+        - hostname: 원래 도메인명
+        - host: 해석된 IP 주소 (getaddrinfo → libc → OS DNS 서버 → 최종 목적지 IP)
+    """
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> List[ResolveResult]:
+        results = await super().resolve(host, port, family)
+        ips = [r["host"] for r in results]
+        _last_dns_result_var.set(ips)
+        return results
+
+
+class TraceRequestContext:
+    """
+    aiohttp가 외부 API 호출 1건마다 생성하는 ctx 객체.
+    on_request_start에서 TraceRecord를 할당하면,
+    이후 모든 콜백(DNS, TCP, end, exception)에서 동일한 record를 참조한다.
+    → asyncio.gather() 병렬 호출에서도 안전.
+
+    aiohttp는 팩토리를 trace_request_ctx= 키워드 인자로 호출하므로 __init__에서 받아야 한다.
+    """
+
+    def __init__(self, trace_request_ctx: object = None) -> None:
+        self.trace_request_ctx = trace_request_ctx
+        self.record = TraceRecord()
+
+
 def create_trace_config() -> TraceConfig:
     """
-    aiohttp TraceConfig를 생성하고, 요청 라이프사이클의 주요 시점에 로깅 콜백을 등록한다.
+    aiohttp TraceConfig를 생성하고, 요청 라이프사이클의 주요 시점에 타이밍 수집 콜백을 등록한다.
+
+    trace_config_ctx_factory=TraceRequestContext
+      → 외부 API 호출마다 새 TraceRequestContext가 생성되어 ctx로 전달됨
+      → 병렬 호출 시에도 각 콜백이 자신의 TraceRecord에만 기록
 
     요청 라이프사이클 순서:
-        on_request_start
+        on_request_start          ← 요청 진입, ctx.record에 TraceRecord 할당
         │
-        ├─ on_connection_queued_start/end   (커넥션 풀 대기)
-        ├─ on_connection_reuseconn          (keep-alive 재사용 시)
+        ├─ on_dns_resolvehost_start/end   (DNS resolve 타이밍)
+        ├─ on_connection_create_start/end (TCP + TLS 타이밍)
         │
-        ├─ on_dns_cache_hit/miss            (DNS 캐시 조회)
-        ├─ on_dns_resolvehost_start/end     (실제 DNS resolve — 캐시 miss 시)
-        ├─ on_connection_create_start/end   (TCP + TLS 핸드셰이크)
-        │
-        ├─ on_request_headers_sent          (HTTP 헤더 전송 완료)
-        ├─ on_request_chunk_sent            (요청 body chunk 전송)
-        ├─ on_response_chunk_received       (응답 body chunk 수신)
-        ├─ on_request_redirect              (301/302 리다이렉트 시)
-        │
-        ├─ on_request_end                   (정상 완료)
-        └─ on_request_exception             (네트워크 레벨 예외)
+        ├─ on_request_end                 (정상 완료, status 기록)
+        └─ on_request_exception           (예외 발생, error 기록)
     """
-    trace_config = TraceConfig()
+    trace_config = TraceConfig(trace_config_ctx_factory=TraceRequestContext)
+
+    # ──────────────────────────────────────────────────────────────
+    # HTTP 요청 시작 — ctx.record에 TraceRecord 할당
+    # ──────────────────────────────────────────────────────────────
+
+    @trace_config.on_request_start.append
+    async def on_request_start(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceRequestStartParams
+    ) -> None:
+        """
+        HTTP 요청이 시작될 때 호출.
+        ctx.record에 새 TraceRecord를 할당하고, trace_records 리스트에 append한다.
+
+        - params.method:  HTTP 메서드
+        - params.url:     요청 URL (yarl.URL)
+        - params.headers: 요청 헤더
+        """
+        rid = request_id_var.get()
+        record = TraceRecord(method=params.method, url=str(params.url))
+        record.request.mark_start()
+        ctx.record = record
+        trace_records_var.get().append(record)
+        logger.info(f"[{rid}] [REQ START] {params.method} {params.url}")
 
     # ──────────────────────────────────────────────────────────────
     # DNS 해석
     # ──────────────────────────────────────────────────────────────
 
     @trace_config.on_dns_resolvehost_start.append
-    async def on_dns_start(session: ClientSession, ctx: Any, params: TraceDnsResolveHostStartParams) -> None:
+    async def on_dns_start(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceDnsResolveHostStartParams
+    ) -> None:
         """
-        DNS 이름 해석이 시작될 때 호출.
+        DNS 이름 해석 시작. ctx.record.dns 타이머를 시작한다.
 
-        - params.host: 해석 대상 호스트명 (e.g. "api.example.com")
+        - params.host: 해석 대상 호스트명
 
         관련 TCPConnector 설정:
-        - use_dns_cache=True  → 캐시 히트 시 이 콜백은 호출되지 않음 (on_dns_cache_hit이 대신 호출)
-        - ttl_dns_cache=300   → 캐시 TTL(초). 만료 후 재요청 시 다시 호출됨
-        - resolver            → ThreadedResolver(기본) 또는 AsyncResolver(aiodns). 어떤 resolver든 동일하게 발생
-        - family=AF_INET      → resolve 결과가 IPv4로 제한되지만, 콜백 호출 여부에는 영향 없음
+        - use_dns_cache=True → 캐시 히트 시 이 콜백 미호출 (on_dns_cache_hit 대신)
+        - ttl_dns_cache      → 캐시 TTL. 만료 후 재요청 시 다시 호출됨
         """
-        logger.debug(f"[DNS] resolving {params.host}")
+        rid = request_id_var.get()
+        ctx.record.dns.mark_start()
+        logger.debug(f"[{rid}] [DNS] resolving {params.host}")
 
     @trace_config.on_dns_resolvehost_end.append
-    async def on_dns_end(session: ClientSession, ctx: Any, params: TraceDnsResolveHostEndParams) -> None:
+    async def on_dns_end(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceDnsResolveHostEndParams
+    ) -> None:
         """
-        DNS 이름 해석이 완료됐을 때 호출.
+        DNS 이름 해석 완료. ctx.record.dns 타이머를 종료하고, 해석된 IP를 기록한다.
 
         - params.host: 해석 완료된 호스트명
 
-        start ~ end 사이의 시간 = 실제 DNS resolve 소요 시간.
-        이 값이 크면 ttl_dns_cache를 늘려 캐시 적중률을 높이거나, AsyncResolver(aiodns)로 전환을 고려.
+        TracingResolver가 resolve() 결과를 _last_dns_result_var에 저장해두고,
+        이 콜백에서 읽어 ctx.record.resolved_ips에 기록한다.
+
+        start ~ end = 실제 DNS resolve 소요 시간.
         """
-        logger.debug(f"[DNS] resolved  {params.host}")
+        rid = request_id_var.get()
+        ctx.record.dns.mark_end()
+        ctx.record.resolved_ips = _last_dns_result_var.get()
+        logger.debug(
+            f"[{rid}] [DNS] resolved  {params.host} → {ctx.record.resolved_ips} "
+            f"({ctx.record.dns.elapsed_ms}ms)"
+        )
 
     # ──────────────────────────────────────────────────────────────
     # TCP 연결
     # ──────────────────────────────────────────────────────────────
 
     @trace_config.on_connection_create_start.append
-    async def on_conn_start(session: ClientSession, ctx: Any, params: TraceConnectionCreateStartParams) -> None:
+    async def on_conn_start(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceConnectionCreateStartParams
+    ) -> None:
         """
-        새 TCP 소켓(+TLS 핸드셰이크) 연결 생성이 시작될 때 호출.
-
-        - params: 속성 없음. 호출 자체가 "새 연결을 열고 있다"는 의미.
+        새 TCP 소켓(+TLS) 연결 생성 시작. ctx.record.tcp 타이머를 시작한다.
 
         관련 TCPConnector 설정:
-        - limit=200           → 전체 동시 연결 상한. 이 한도 내에서만 새 연결 생성 → 이 콜백 호출
-        - limit_per_host=25   → 동일 (host, port, ssl) 조합당 상한. 초과 시 큐 대기 (on_connection_queued_start)
-        - force_close=True    → keep-alive 비활성화. 매 요청마다 새 연결 → 이 콜백이 항상 호출됨
-        - keepalive_timeout   → keep-alive 커넥션이 살아있으면 재사용 → 이 콜백 미호출 (on_connection_reuseconn 대신)
-        - enable_cleanup_closed=True → SSL 비정상 종료 시 2초 후 transport abort. 풀 정리로 새 연결 빈도에 간접 영향
+        - limit / limit_per_host → 한도 내에서만 새 연결 → 이 콜백 호출
+        - keepalive_timeout      → keep-alive 재사용 시 이 콜백 미호출
+        - force_close=True       → 매 요청마다 새 연결 → 항상 호출
         """
-        logger.debug("[CONN] creating connection")
+        rid = request_id_var.get()
+        ctx.record.tcp.mark_start()
+        logger.debug(f"[{rid}] [CONN] creating connection")
 
     @trace_config.on_connection_create_end.append
-    async def on_conn_end(session: ClientSession, ctx: Any, params: TraceConnectionCreateEndParams) -> None:
+    async def on_conn_end(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceConnectionCreateEndParams
+    ) -> None:
         """
-        새 TCP 소켓(+TLS) 연결 생성이 완료됐을 때 호출.
+        TCP 소켓(+TLS) 연결 생성 완료. ctx.record.tcp 타이머를 종료한다.
 
-        - params: 속성 없음.
-
-        start ~ end 사이의 시간 = TCP 연결 + TLS 핸드셰이크 소요 시간.
-        이 값이 크면 네트워크 지연이 높거나 TLS 협상이 느린 것.
-        keep-alive를 활용해 연결 재사용을 늘리면 이 콜백 호출 빈도가 줄어든다.
+        start ~ end = TCP 연결 + TLS 핸드셰이크 소요 시간.
         """
-        logger.debug("[CONN] connection created")
+        rid = request_id_var.get()
+        ctx.record.tcp.mark_end()
+        logger.debug(f"[{rid}] [CONN] connection created ({ctx.record.tcp.elapsed_ms}ms)")
 
     # ──────────────────────────────────────────────────────────────
-    # HTTP 요청 / 응답
+    # HTTP 요청 완료
     # ──────────────────────────────────────────────────────────────
-
-    @trace_config.on_request_start.append
-    async def on_request_start(session: ClientSession, ctx: Any, params: TraceRequestStartParams) -> None:
-        """
-        HTTP 요청이 시작될 때 호출. 모든 요청의 첫 번째 콜백.
-
-        - params.method:  HTTP 메서드 ("GET", "POST" 등)
-        - params.url:     요청 URL (yarl.URL 객체)
-        - params.headers: 요청 헤더 (CIMultiDictProxy)
-
-        리다이렉트 시 리다이렉트된 요청마다 다시 호출됨.
-        ClientSession.request()를 호출하는 순간 발생.
-        """
-        logger.info(f"[REQ START] {params.method} {params.url}")
 
     @trace_config.on_request_end.append
-    async def on_request_end(session: ClientSession, ctx: Any, params: TraceRequestEndParams) -> None:
+    async def on_request_end(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceRequestEndParams
+    ) -> None:
         """
-        HTTP 응답을 정상적으로 수신 완료했을 때 호출.
+        HTTP 응답 수신 완료. ctx.record.request 타이머를 종료하고 status를 기록한다.
 
-        - params.method:   요청 메서드
-        - params.url:      요청 URL
-        - params.headers:  요청 헤더
-        - params.response: aiohttp.ClientResponse (status, headers 등 접근 가능)
+        - params.response: aiohttp.ClientResponse (status, headers 등)
 
         주의: raise_for_status() 이전에 호출됨.
-        즉 4xx/5xx 응답이어도 "응답 수신 자체가 성공"이면 이 콜백은 호출된다.
-        네트워크 에러/타임아웃처럼 응답 자체를 못 받은 경우는 on_request_exception으로 간다.
+        4xx/5xx여도 응답 수신 성공이면 이 콜백이 호출된다.
         """
-        logger.info(f"[REQ END]   {params.method} {params.url} → {params.response.status}")
+        rid = request_id_var.get()
+        record = ctx.record
+        record.request.mark_end()
+        record.status = params.response.status
+        logger.info(
+            f"[{rid}] [REQ END] {params.method} {params.url} → {params.response.status} "
+            f"(total={record.request.elapsed_ms}ms, dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms)"
+        )
 
     # ──────────────────────────────────────────────────────────────
     # 요청 예외
     # ──────────────────────────────────────────────────────────────
 
     @trace_config.on_request_exception.append
-    async def on_request_exception(session: ClientSession, ctx: Any, params: TraceRequestExceptionParams) -> None:
+    async def on_request_exception(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceRequestExceptionParams
+    ) -> None:
         """
-        요청 처리 중 네트워크 레벨 예외가 발생했을 때 호출.
+        네트워크 레벨 예외 발생. ctx.record.request 타이머를 종료하고 error를 기록한다.
 
-        - params.method:    요청 메서드
-        - params.url:       요청 URL
-        - params.headers:   요청 헤더
-        - params.exception: 발생한 예외 객체 (ConnectionError, TimeoutError 등)
+        - params.exception: 발생한 예외 (ConnectionError, TimeoutError 등)
 
-        주의: raise_for_status()에 의한 ClientResponseError는 여기서 호출되지 않음.
-        응답 자체는 정상 수신됐으므로 on_request_end가 호출된다.
-
-        관련 ClientTimeout 설정:
-        - total        → 전체 요청 타임아웃
-        - connect      → 연결 수립 타임아웃
-        - sock_read    → 소켓 읽기 타임아웃
-        - sock_connect → 소켓 연결 타임아웃
-        이 중 하나라도 초과하면 asyncio.TimeoutError → 이 콜백 호출
+        raise_for_status()에 의한 ClientResponseError는 여기서 호출되지 않음.
         """
-        logger.error(f"[REQ ERROR] {params.method} {params.url} → {params.exception}")
+        rid = request_id_var.get()
+        record = ctx.record
+
+        # 타임아웃 등으로 start만 호출되고 end가 안 된 구간을 timeout으로 마감
+        # aiohttp 내부에서 on_connection_create_start가 on_dns_resolvehost_start보다
+        # 먼저 호출되므로, DNS가 timeout이면 TCP는 실제로 시작되지 않은 것 → idle로 리셋
+        if record.dns.status == "running":
+            record.dns.mark_timeout()
+            record.tcp.reset()
+        elif record.tcp.status == "running":
+            record.tcp.mark_timeout()
+
+        record.request.mark_timeout()
+        record.error = str(params.exception)
+        logger.error(
+            f"[{rid}] [REQ ERROR] {params.method} {params.url} → {params.exception} "
+            f"(total={record.request.elapsed_ms}ms, dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms)"
+        )
 
     return trace_config
