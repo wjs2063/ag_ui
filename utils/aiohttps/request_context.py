@@ -11,6 +11,7 @@ trace_records 에 쌓이는 단건 구조 예시:
     {
         "method": "GET",
         "url": "https://api.example.com/data",
+        "pool": {"start": 1.200, "end": 1.234, "elapsed_ms": 34.0},
         "dns":  {"start": 1.234, "end": 1.240, "elapsed_ms": 6.0},
         "tcp":  {"start": 1.240, "end": 1.280, "elapsed_ms": 40.0},
         "request": {"start": 1.200, "end": 1.350, "elapsed_ms": 150.0},
@@ -80,6 +81,7 @@ class TraceRecord:
     """외부 API 호출 1건에 대한 전체 타이밍 기록"""
     method: str = ""
     url: str = ""
+    pool: PhaseTimer = field(default_factory=PhaseTimer)
     dns: PhaseTimer = field(default_factory=PhaseTimer)
     tcp: PhaseTimer = field(default_factory=PhaseTimer)
     request: PhaseTimer = field(default_factory=PhaseTimer)
@@ -91,6 +93,7 @@ class TraceRecord:
         return {
             "method": self.method,
             "url": self.url,
+            "pool": self.pool.to_dict(),
             "dns": self.dns.to_dict(),
             "tcp": self.tcp.to_dict(),
             "request": self.request.to_dict(),

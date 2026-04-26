@@ -162,6 +162,10 @@ async def test_timeout_pool():
     limit=1 커넥터로 동시 2건 요청 → 1건은 풀 대기 → connect 타임아웃.
     - 1번 요청: delay/3 (3초 소요, 유일한 커넥션 점유)
     - 2번 요청: delay/0 (풀에 빈 자리 없어서 대기 → 1초 후 타임아웃)
+
+    응답 trace[].pool.elapsed_ms 로 풀 대기 시간을 확인할 수 있다.
+    1번 요청: pool.status == "idle" (즉시 슬롯 획득)
+    2번 요청: pool.status == "timeout" (1초 대기 후 connect 타임아웃)
     """
     connector = TCPConnector(limit=1, limit_per_host=1, family=socket.AF_INET)
     async with ClientSession(

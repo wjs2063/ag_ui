@@ -13,6 +13,8 @@ from aiohttp import (
     TraceRequestEndParams,
     TraceConnectionCreateStartParams,
     TraceConnectionCreateEndParams,
+    TraceConnectionQueuedStartParams,
+    TraceConnectionQueuedEndParams,
     TraceDnsResolveHostStartParams,
     TraceDnsResolveHostEndParams,
     TraceRequestExceptionParams,
@@ -82,6 +84,7 @@ def create_trace_config() -> TraceConfig:
     요청 라이프사이클 순서:
         on_request_start          ← 요청 진입, ctx.record에 TraceRecord 할당
         │
+        ├─ on_connection_queued_start/end (풀 한도 초과 시 슬롯 대기)
         ├─ on_dns_resolvehost_start/end   (DNS resolve 타이밍)
         ├─ on_connection_create_start/end (TCP + TLS 타이밍)
         │
@@ -112,6 +115,40 @@ def create_trace_config() -> TraceConfig:
         ctx.record = record
         trace_records_var.get().append(record)
         logger.info(f"[{rid}] [REQ START] {params.method} {params.url}")
+
+    # ──────────────────────────────────────────────────────────────
+    # Connection Pool 대기
+    # ──────────────────────────────────────────────────────────────
+
+    @trace_config.on_connection_queued_start.append
+    async def on_conn_queued_start(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceConnectionQueuedStartParams
+    ) -> None:
+        """
+        Connector 풀(limit / limit_per_host)이 가득 차서 슬롯을 기다리기 시작.
+        ctx.record.pool 타이머를 시작한다.
+
+        이 콜백은 풀이 포화 상태일 때만 호출된다. 한도 내에서 즉시 슬롯을 잡으면
+        호출되지 않으므로, pool.status == "idle"이면 대기 없이 진행된 것.
+        """
+        rid = request_id_var.get()
+        ctx.record.pool.mark_start()
+        logger.debug(f"[{rid}] [POOL] waiting for connection slot")
+
+    @trace_config.on_connection_queued_end.append
+    async def on_conn_queued_end(
+        session: ClientSession, ctx: TraceRequestContext, params: TraceConnectionQueuedEndParams
+    ) -> None:
+        """
+        풀에 슬롯이 생겨 대기 종료. ctx.record.pool 타이머를 종료한다.
+
+        start ~ end = 풀 대기 소요 시간.
+        이후 흐름: 재사용 가능한 keep-alive 커넥션이 있으면 바로 요청 진행,
+        없으면 on_connection_create_start로 새 연결 생성.
+        """
+        rid = request_id_var.get()
+        ctx.record.pool.mark_end()
+        logger.debug(f"[{rid}] [POOL] slot acquired ({ctx.record.pool.elapsed_ms}ms)")
 
     # ──────────────────────────────────────────────────────────────
     # DNS 해석
@@ -211,7 +248,8 @@ def create_trace_config() -> TraceConfig:
         record.status = params.response.status
         logger.info(
             f"[{rid}] [REQ END] {params.method} {params.url} → {params.response.status} "
-            f"(total={record.request.elapsed_ms}ms, dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms)"
+            f"(total={record.request.elapsed_ms}ms, pool={record.pool.elapsed_ms}ms, "
+            f"dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms)"
         )
 
     # ──────────────────────────────────────────────────────────────
@@ -232,10 +270,14 @@ def create_trace_config() -> TraceConfig:
         rid = request_id_var.get()
         record = ctx.record
 
-        # 타임아웃 등으로 start만 호출되고 end가 안 된 구간을 timeout으로 마감
-        # aiohttp 내부에서 on_connection_create_start가 on_dns_resolvehost_start보다
-        # 먼저 호출되므로, DNS가 timeout이면 TCP는 실제로 시작되지 않은 것 → idle로 리셋
-        if record.dns.status == "running":
+        # 타임아웃 등으로 start만 호출되고 end가 안 된 구간을 timeout으로 마감.
+        # 라이프사이클 순서가 pool → dns → tcp 이므로, 앞 단계가 timeout이면
+        # 뒤 단계는 실제로 시작되지 않은 것 → idle로 리셋.
+        if record.pool.status == "running":
+            record.pool.mark_timeout()
+            record.dns.reset()
+            record.tcp.reset()
+        elif record.dns.status == "running":
             record.dns.mark_timeout()
             record.tcp.reset()
         elif record.tcp.status == "running":
@@ -245,7 +287,8 @@ def create_trace_config() -> TraceConfig:
         record.error = str(params.exception)
         logger.error(
             f"[{rid}] [REQ ERROR] {params.method} {params.url} → {params.exception} "
-            f"(total={record.request.elapsed_ms}ms, dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms)"
+            f"(total={record.request.elapsed_ms}ms, pool={record.pool.elapsed_ms}ms, "
+            f"dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms)"
         )
 
     return trace_config

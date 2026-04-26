@@ -12,7 +12,10 @@
       "Bash(uv add:*)",
       "Bash(python -c \"import ag_ui.core; print\\(dir\\(ag_ui.core\\)\\)\")",
       "Bash(uv run:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Read(//Users/jeonjaehyeon/Desktop/개발/projects/ai_project/ai_poc/**)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['utils/aiohttps/trace.py', 'utils/aiohttps/request_context.py', 'utils/aiohttps/example.py', 'utils/aiohttps/aiohttp_wrapper.py']]; print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['utils/aiohttps/trace.py', 'utils/aiohttps/request_context.py', 'utils/aiohttps/example.py', 'utils/aiohttps/aiohttp_wrapper.py']]; print\\('OK'\\)\")"
     ]
   }
 }
