@@ -5,7 +5,7 @@ from typing import Optional, Any, Dict, Tuple
 import socket
 from multidict import MultiMapping
 from .trace import create_trace_config, TracingResolver
-
+import asyncio
 class DetailedClientResponseError(ClientResponseError):
     """ClientResponseError + response_body (str, 500자 truncate)"""
 
@@ -73,17 +73,21 @@ class AioHttpClient(HTTPClientSessionInterface):
     async def _request(self, method: str, url: str, **kwargs) -> Optional[dict]:
         if not self._session:
             raise RuntimeError("Client is not initialized. Check lifespan.")
-        # 기본 헤더 설정 (압축 전송 요청)
+
         headers = kwargs.pop("headers", {}) or {}
         headers.setdefault("Accept-Encoding", "gzip, deflate")
         if method.upper() in ("POST", "PUT", "PATCH"):
             headers.setdefault("Content-Type", "application/json")
 
-        async with self._session.request(method, url, headers=headers, **kwargs) as response:
+        resp = None
+        cancelled = False
+        try:
+            resp = await self._session.request(method, url, headers=headers, **kwargs)
+
             try:
-                response.raise_for_status()
+                resp.raise_for_status()
             except ClientResponseError as e:
-                body = await response.text()
+                body = await resp.text()
                 raise DetailedClientResponseError(
                     request_info=e.request_info,
                     history=e.history,
@@ -93,11 +97,20 @@ class AioHttpClient(HTTPClientSessionInterface):
                     response_body=body,
                 ) from e
 
-            # [Performance] bytes로 읽어서 orjson으로 파싱 (Zero-copy 지향)
-            raw_bytes = await response.read()
+            raw_bytes = await resp.read()
             if not raw_bytes:
                 return None
             return orjson.loads(raw_bytes)
+
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if resp is not None and not resp.closed:
+                if cancelled:
+                    resp.close()    # drain 없이 즉시 닫음 → 슬롯 회수
+                else:
+                    resp.release()  # 풀에 반환 → 커넥션 재사용
 
     async def get(self, url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[dict] = None, **kwargs) -> Optional[dict]:
         return await self._request("GET", url, params=params, headers=headers, **kwargs)

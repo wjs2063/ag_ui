@@ -13,6 +13,7 @@ import sys
 import os
 from contextlib import asynccontextmanager
 
+import aiohttp
 import uvicorn
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
@@ -37,6 +38,7 @@ logging.basicConfig(
 
 client = AioHttpClient()
 
+aiohttp.ClientTimeout
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
