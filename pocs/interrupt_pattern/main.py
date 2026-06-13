@@ -57,10 +57,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
       - 완료된 thread 에서는 마지막 상태를 그대로 반환
     분기 로직은 모두 노드 안 (각 interrupt 시점의 페이로드 종류) 에 있다.
     """
+    print("요청 :",req)
     thread_id = req.thread_id or str(uuid.uuid4())
     cfg = {"configurable": {"thread_id": thread_id}}
     try:
         result = await app.state.graph.ainvoke(Command(resume=req.message), cfg)
+        print(result)
     except ValueError as e:
         raise HTTPException(422, detail=str(e)) from e
     return _next_message(thread_id, result)
