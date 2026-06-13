@@ -77,6 +77,29 @@ class PhaseTimer:
 
 
 @dataclass
+class PoolSnapshot:
+    """TCPConnector 내부 카운터 스냅샷 (private API 사용)."""
+    limit: int = 0
+    limit_per_host: int = 0
+    acquired_total: int = 0
+    acquired_for_host: int = 0
+    idle_for_host: int = 0
+    waiters_for_host: int = 0
+    host_key: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "limit": self.limit,
+            "limit_per_host": self.limit_per_host,
+            "acquired_total": self.acquired_total,
+            "acquired_for_host": self.acquired_for_host,
+            "idle_for_host": self.idle_for_host,
+            "waiters_for_host": self.waiters_for_host,
+            "host_key": self.host_key,
+        }
+
+
+@dataclass
 class TraceRecord:
     """외부 API 호출 1건에 대한 전체 타이밍 기록"""
     method: str = ""
@@ -88,6 +111,8 @@ class TraceRecord:
     resolved_ips: list[str] = field(default_factory=list)
     status: Optional[int] = None
     error: Optional[str] = None
+    pool_before: Optional[PoolSnapshot] = None
+    pool_after: Optional[PoolSnapshot] = None
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +125,8 @@ class TraceRecord:
             "resolved_ips": self.resolved_ips,
             "status": self.status,
             "error": self.error,
+            "pool_before": self.pool_before.to_dict() if self.pool_before else None,
+            "pool_after": self.pool_after.to_dict() if self.pool_after else None,
         }
 
 

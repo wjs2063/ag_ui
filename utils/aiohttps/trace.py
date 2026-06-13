@@ -26,6 +26,7 @@ from .request_context import (
     request_id_var,
     trace_records_var,
     TraceRecord,
+    PoolSnapshot,
 )
 
 # DNS 해석 결과를 콜백에 전달하기 위한 ContextVar
@@ -73,6 +74,52 @@ class TraceRequestContext:
         self.record = TraceRecord()
 
 
+def _snapshot_pool(session: ClientSession, host: str, port: int, is_ssl: bool) -> PoolSnapshot:
+    """
+    session._connector 내부 카운터 읽기.
+    aiohttp 3.13.x private API 의존 — 버전 업그레이드 시 점검 필요.
+    실패 시 빈 스냅샷 반환(trace가 요청을 깨뜨리지 않게).
+    """
+    try:
+        connector = session._connector
+        if connector is None:
+            return PoolSnapshot()
+
+        # _acquired_per_host는 defaultdict라 미존재 키 접근 시 빈 set 자동 생성됨 → 키 매칭으로 회피
+        matched_key = None
+        for key in connector._acquired_per_host.keys():
+            if key.host == host and key.port == port and key.is_ssl == is_ssl:
+                matched_key = key
+                break
+
+        return PoolSnapshot(
+            limit=connector.limit,
+            limit_per_host=connector.limit_per_host,
+            acquired_total=len(connector._acquired),
+            acquired_for_host=len(connector._acquired_per_host[matched_key]) if matched_key else 0,
+            idle_for_host=len(connector._conns[matched_key]) if matched_key and matched_key in connector._conns else 0,
+            waiters_for_host=len(connector._waiters[matched_key]) if matched_key and matched_key in connector._waiters else 0,
+            host_key=f"{host}:{port}",
+        )
+    except Exception:
+        return PoolSnapshot(host_key=f"{host}:{port}")
+
+
+def _format_pool(snap: PoolSnapshot) -> str:
+    return (
+        f"pool={snap.acquired_total}/{snap.limit} "
+        f"host={snap.host_key} {snap.acquired_for_host}/{snap.limit_per_host} "
+        f"idle={snap.idle_for_host} waiters={snap.waiters_for_host}"
+    )
+
+
+def _url_host_port_ssl(url) -> tuple[str, int, bool]:
+    is_ssl = url.scheme == "https"
+    host = url.host or ""
+    port = url.port if url.port is not None else (443 if is_ssl else 80)
+    return host, port, is_ssl
+
+
 def create_trace_config() -> TraceConfig:
     """
     aiohttp TraceConfig를 생성하고, 요청 라이프사이클의 주요 시점에 타이밍 수집 콜백을 등록한다.
@@ -112,9 +159,13 @@ def create_trace_config() -> TraceConfig:
         rid = request_id_var.get()
         record = TraceRecord(method=params.method, url=str(params.url))
         record.request.mark_start()
+        host, port, is_ssl = _url_host_port_ssl(params.url)
+        record.pool_before = _snapshot_pool(session, host, port, is_ssl)
         ctx.record = record
         trace_records_var.get().append(record)
-        logger.info(f"[{rid}] [REQ START] {params.method} {params.url}")
+        logger.info(
+            f"[{rid}] [REQ START] {params.method} {params.url} | {_format_pool(record.pool_before)}"
+        )
 
     # ──────────────────────────────────────────────────────────────
     # Connection Pool 대기
@@ -246,10 +297,13 @@ def create_trace_config() -> TraceConfig:
         record = ctx.record
         record.request.mark_end()
         record.status = params.response.status
+        host, port, is_ssl = _url_host_port_ssl(params.url)
+        record.pool_after = _snapshot_pool(session, host, port, is_ssl)
         logger.info(
             f"[{rid}] [REQ END] {params.method} {params.url} → {params.response.status} "
             f"(total={record.request.elapsed_ms}ms, pool={record.pool.elapsed_ms}ms, "
-            f"dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms)"
+            f"dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms) | "
+            f"{_format_pool(record.pool_after)}"
         )
 
     # ──────────────────────────────────────────────────────────────
@@ -285,10 +339,13 @@ def create_trace_config() -> TraceConfig:
 
         record.request.mark_timeout()
         record.error = str(params.exception)
+        host, port, is_ssl = _url_host_port_ssl(params.url)
+        record.pool_after = _snapshot_pool(session, host, port, is_ssl)
         logger.error(
             f"[{rid}] [REQ ERROR] {params.method} {params.url} → {params.exception} "
             f"(total={record.request.elapsed_ms}ms, pool={record.pool.elapsed_ms}ms, "
-            f"dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms)"
+            f"dns={record.dns.elapsed_ms}ms, tcp={record.tcp.elapsed_ms}ms) | "
+            f"{_format_pool(record.pool_after)}"
         )
 
     return trace_config

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:a2a-protocol.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(uv sync *)",
+      "Bash(uv run *)",
+      "Bash(docker exec *)",
+      "Bash(docker port *)"
+    ]
+  }
+}

@@ -109,5 +109,5 @@ def generate_excel(count: int, filename: str = "lotto.xlsx"):
 
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     generate_excel(n)

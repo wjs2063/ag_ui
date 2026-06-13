@@ -6,6 +6,7 @@ import socket
 from multidict import MultiMapping
 from .trace import create_trace_config, TracingResolver
 import asyncio
+import aiohttp
 class DetailedClientResponseError(ClientResponseError):
     """ClientResponseError + response_body (str, 500자 truncate)"""
 
@@ -78,7 +79,7 @@ class AioHttpClient(HTTPClientSessionInterface):
         headers.setdefault("Accept-Encoding", "gzip, deflate")
         if method.upper() in ("POST", "PUT", "PATCH"):
             headers.setdefault("Content-Type", "application/json")
-
+        _timeout = aiohttp.ClientTimeout(total=3,connect=1,sock_connect=1,sock_read=1)
         resp = None
         cancelled = False
         try:
