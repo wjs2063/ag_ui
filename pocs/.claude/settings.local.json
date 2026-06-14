@@ -23,7 +23,9 @@
       "Bash(curl -s -m5 http://127.0.0.1:9999/.well-known/agent-card.json)",
       "Bash(env)",
       "Bash(curl -s http://127.0.0.1:8001/openapi.json)",
-      "Bash(curl -s -m5 http://127.0.0.1:8001/openapi.json)"
+      "Bash(curl -s -m5 http://127.0.0.1:8001/openapi.json)",
+      "Bash(curl -s -m5 http://127.0.0.1:9101/.well-known/agent-card.json)",
+      "Bash(curl -s -m5 -X POST http://127.0.0.1:9102/ -d '{}')"
     ]
   }
 }
