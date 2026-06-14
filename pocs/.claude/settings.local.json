@@ -8,7 +8,22 @@
       "Bash(uv sync *)",
       "Bash(uv run *)",
       "Bash(docker exec *)",
-      "Bash(docker port *)"
+      "Bash(docker port *)",
+      "Bash(pg_isready -h localhost -p 5432)",
+      "Bash(nc -z 127.0.0.1 9999)",
+      "Bash(nc -z 127.0.0.1 8001)",
+      "Bash(curl -s -m 5 http://127.0.0.1:9999/.well-known/agent-card.json)",
+      "Bash(rm -f /tmp/orch.log)",
+      "Bash(INTERRUPT_POC_FASTAPI_PORT=8001 uv run uvicorn pocs.interrupt_pattern.main:app --host 127.0.0.1 --port 8001 --log-level info)",
+      "Read(//tmp/**)",
+      "Bash(xargs kill -9)",
+      "Bash(INTERRUPT_POC_FASTAPI_PORT=8001 uv run uvicorn pocs.interrupt_pattern.main:app --host 127.0.0.1 --port 8001 --log-level warning)",
+      "Bash(curl -s -m 5 http://127.0.0.1:8001/health)",
+      "Bash(curl -s -m5 http://127.0.0.1:8001/health)",
+      "Bash(curl -s -m5 http://127.0.0.1:9999/.well-known/agent-card.json)",
+      "Bash(env)",
+      "Bash(curl -s http://127.0.0.1:8001/openapi.json)",
+      "Bash(curl -s -m5 http://127.0.0.1:8001/openapi.json)"
     ]
   }
 }

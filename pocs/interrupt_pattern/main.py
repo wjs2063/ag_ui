@@ -8,86 +8,63 @@ from pydantic import BaseModel
 
 from pocs.interrupt_pattern.checkpointer import lifespan_checkpointer
 from pocs.interrupt_pattern.config import DATABASE_URL
-from pocs.interrupt_pattern.graph import build_graph
+from pocs.interrupt_pattern.graph import build_orchestrator_graph
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with lifespan_checkpointer(DATABASE_URL) as saver:
-        app.state.graph = build_graph(saver)
-        app.state.checkpointer = saver
+        app.state.orchestrator = build_orchestrator_graph(saver)
         yield
 
 
 app = FastAPI(title="LangGraph Interrupt POC", lifespan=lifespan)
 
 
+class UserMessage(BaseModel):
+    question: str
+    metadata: dict[str, Any] = {}
+
+
 class ChatRequest(BaseModel):
-    message: Any
+    message: UserMessage  # {"question": "...", "metadata": {...}} 형태 강제
     thread_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     thread_id: str
     message: Any
-    done: bool = False
-
-
-def _next_message(thread_id: str, result: dict) -> ChatResponse:
-    if "__interrupt__" in result and result["__interrupt__"]:
-        return ChatResponse(
-            thread_id=thread_id,
-            message=result["__interrupt__"][0].value,
-            done=False,
-        )
-    return ChatResponse(
-        thread_id=thread_id,
-        message=result.get("response", ""),
-        done=True,
-    )
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    """Single chat endpoint.
+    """client → 서버 → A2A(LLM, 항상 input_required) → interrupt → client 의 무한 루프.
 
-    Server is uniform: always Command(resume=message).
-      - 새 thread 에서는 resume 값이 소비되지 않고 그래프가 첫 interrupt 까지 진행
-      - 진행 중 thread 에서는 노드의 interrupt() 자리로 값이 그대로 들어감
-      - 완료된 thread 에서는 마지막 상태를 그대로 반환
-    분기 로직은 모두 노드 안 (각 interrupt 시점의 페이로드 종류) 에 있다.
+    thread_id 는 클라이언트 고유 ID 처럼 고정. 그래프는 END 로 끝나지 않고 매 턴
+    interrupt 에서 멈춰 다음 메시지를 기다리므로 같은 thread_id 로 대화가 계속된다.
     """
-    print("요청 :",req)
     thread_id = req.thread_id or str(uuid.uuid4())
+    print(f"\n[CLIENT → 서버] message={req.message}  thread_id={thread_id}")
     cfg = {"configurable": {"thread_id": thread_id}}
+    orch = app.state.orchestrator
+    resume = req.message.model_dump()  # {"question": ..., "metadata": ...}
     try:
-        result = await app.state.graph.ainvoke(Command(resume=req.message), cfg)
-        print(result)
+        result = await orch.ainvoke(Command(resume=resume), cfg)
     except ValueError as e:
         raise HTTPException(422, detail=str(e)) from e
-    return _next_message(thread_id, result)
 
+    # 정상이면 항상 interrupt 에서 멈춘다. 없으면 오래된/종료된 체크포인트이므로
+    # thread 를 초기화하고 새로 시작한다(같은 thread_id 재사용도 항상 동작).
+    if "__interrupt__" not in result:
+        await orch.checkpointer.adelete_thread(thread_id)
+        result = await orch.ainvoke(Command(resume=resume), cfg)
 
-@app.get("/state/{thread_id}")
-async def get_state(thread_id: str):
-    cfg = {"configurable": {"thread_id": thread_id}}
-    snap = await app.state.graph.aget_state(cfg)
-    return {
-        "thread_id": thread_id,
-        "values": {k: v for k, v in snap.values.items() if k != "messages"},
-        "next": list(snap.next),
-        "awaiting_input": bool(snap.tasks) and any(t.interrupts for t in snap.tasks),
-    }
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+    reply = result["__interrupt__"][0].value
+    print(f"[서버 → CLIENT] message={reply}")
+    return ChatResponse(thread_id=thread_id, message=reply)
 
 
 if __name__ == "__main__":
-
-
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)

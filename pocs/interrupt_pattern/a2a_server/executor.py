@@ -5,102 +5,84 @@ from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import TaskState
 from a2a.utils.message import new_agent_text_message
-from langgraph.types import Command
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    messages_from_dict,
+)
+from langchain_openai import ChatOpenAI
+
+from pocs.interrupt_pattern.config import OPENAI_MODEL
+
+_llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0.7)
+
+_SYSTEM = (
+    "너는 사용자에게 계속 추가 정보를 묻는 대화 도우미야. "
+    "이전 대화 히스토리를 참고해 맥락에 맞게 답하고, 사용자의 입력에 한국어로 아주 "
+    "짧게 반응한 뒤, 더 알아내기 위한 후속 질문을 한 문장으로 해. 대화를 절대 끝내지 마."
+)
+
+
+def _extract(message) -> tuple[str, list[BaseMessage]]:
+    """요청 메시지의 DataPart 에서 (question, history) 를 추출한다."""
+    for part in message.parts:
+        root = part.root
+        if root.kind == "data":
+            data = root.data or {}
+            meta = root.metadata or {}
+            history = messages_from_dict(meta.get("history") or [])
+            return data.get("question") or "", history
+    return "", []  # DataPart 가 없으면 빈 입력
 
 
 class LangGraphExecutor(AgentExecutor):
-    """A2A AgentExecutor backed by a LangGraph that uses `interrupt()`.
-
-    Maps:
-      - A2A task_id -> LangGraph thread_id (1:1)
-      - LangGraph interrupt -> A2A TaskState.input_required
-      - Follow-up A2A message -> Command(resume=user_text)
-    """
-
-    def __init__(self, graph):
-        self.graph = graph
+    def __init__(self, graph=None):
+        self.graph = graph  # 미사용(호환용)
 
     async def execute(
         self, context: RequestContext, event_queue: EventQueue
     ) -> None:
         task_id = context.task_id or context.message.message_id
         context_id = context.context_id or task_id
-        thread_id = context.context_id or task_id
-        cfg = {"configurable": {"thread_id": thread_id}}
 
-        user_text = context.get_user_input() or ""
+        question, history = _extract(context.message)
+        print(f"\n[A2A server] ▶ execute  task_id={task_id} context_id={context_id}")
+        print(f"[A2A server]   question={question!r}  history={len(history)}개")
+        for m in history:
+            print(f"[A2A server]     · {type(m).__name__}: {m.content}")
 
         updater = TaskUpdater(event_queue, task_id, context_id)
         if not context.current_task:
+            print(f"[A2A server]   event → TaskState.submitted")
             await updater.submit()
+        print(f"[A2A server]   event → TaskState.working")
         await updater.start_work()
 
-        snap = await self.graph.aget_state(cfg)
-        has_interrupt = bool(snap.tasks) and any(t.interrupts for t in snap.tasks)
-
-        if has_interrupt:
-            resume_value = self._parse_resume(user_text, snap)
-            result = await self.graph.ainvoke(Command(resume=resume_value), cfg)
-        else:
-            result = await self.graph.ainvoke({"message": user_text}, cfg)
-
-        if "__interrupt__" in result and result["__interrupt__"]:
-            payload = result["__interrupt__"][0].value
-            prompt = (
-                payload
-                if isinstance(payload, str)
-                else payload.get("question") or json.dumps(payload, ensure_ascii=False)
-            )
-            await updater.update_status(
-                TaskState.input_required,
-                message=new_agent_text_message(prompt, context_id, task_id),
-                final=True,
-            )
-            return
-
-        response_text = result.get("response", "(no response)")
+        # history + 현재 question 으로 맥락을 반영해 LLM 응답 생성 → 항상 input_required
+        llm_input = (
+            [SystemMessage(content=_SYSTEM)]
+            + history
+            + [HumanMessage(content=question or "(빈 입력)")]
+        )
+        ai = await _llm.ainvoke(llm_input)
+        print(f"[A2A server]   LLM 응답={ai.content!r}")
+        payload = {"type": "ask", "question": ai.content}
+        print(f"[A2A server]   event → TaskState.input_required (final=True)")
         await updater.update_status(
-            TaskState.completed,
-            message=new_agent_text_message(response_text, context_id, task_id),
+            TaskState.input_required,
+            message=new_agent_text_message(
+                json.dumps(payload, ensure_ascii=False), context_id, task_id
+            ),
             final=True,
         )
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue
     ) -> None:
-        task_id = context.task_id or (context.message.message_id if context.message else "unknown")
+        task_id = context.task_id or (
+            context.message.message_id if context.message else "unknown"
+        )
         context_id = context.context_id or task_id
         updater = TaskUpdater(event_queue, task_id, context_id)
         await updater.cancel()
-
-    def _parse_resume(self, user_text: str, snap) -> object:
-        pending = next(
-            (t.interrupts[0] for t in snap.tasks if t.interrupts), None
-        )
-        if pending is None:
-            return user_text
-
-        value = pending.value
-        if isinstance(value, str):
-            return user_text
-
-        stripped = user_text.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            try:
-                return json.loads(stripped)
-            except json.JSONDecodeError:
-                pass
-
-        if isinstance(value, dict) and value.get("type") == "confirm":
-            choice = stripped.lower()
-            if choice not in ("yes", "no"):
-                choice = "yes" if choice in ("y", "동의", "ok") else "no"
-            return {"choice": choice}
-
-        if isinstance(value, dict) and value.get("type") == "tool_review":
-            action = stripped.lower()
-            if action not in ("approve", "reject", "edit"):
-                action = "approve" if action in ("ok", "yes", "승인") else "reject"
-            return {"action": action, "note": user_text}
-
-        return user_text

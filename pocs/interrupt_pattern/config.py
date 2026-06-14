@@ -1,5 +1,9 @@
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()  # .env 의 OPENAI_API_KEY 등을 로드
+
 DATABASE_URL = os.getenv(
     "INTERRUPT_POC_DATABASE_URL",
     "postgresql://postgres:changethis@localhost:5432/app",
