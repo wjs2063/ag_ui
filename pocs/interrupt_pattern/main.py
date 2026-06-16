@@ -2,7 +2,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from pydantic import BaseModel
@@ -53,17 +53,14 @@ async def chat(req: ChatRequest) -> ChatResponse:
     print(f"\n[CLIENT → 서버] message={req.message}  thread_id={thread_id}")
     cfg = {"configurable": {"thread_id": thread_id}}
     orch = app.state.orchestrator
-    resume = req.message.model_dump()  # {"question": ..., "metadata": ...}
-    try:
-        result = await orch.ainvoke(Command(resume=resume), cfg)
-    except ValueError as e:
-        raise HTTPException(422, detail=str(e)) from e
 
-    # 정상이면 항상 interrupt 에서 멈춘다. 없으면 오래된/종료된 체크포인트이므로
-    # thread 를 초기화하고 새로 시작한다(같은 thread_id 재사용도 항상 동작).
-    if "__interrupt__" not in result:
-        await orch.checkpointer.adelete_thread(thread_id)
-        result = await orch.ainvoke(Command(resume=resume), cfg)
+    snap = await orch.aget_state(cfg)
+    if snap.next:  # interrupt 대기 중 → 답으로 재개
+        result = await orch.ainvoke(Command(resume=req.message.model_dump()), cfg)
+    else:  # 새 대화/idle → 첫 메시지를 입력으로 시작(버려지지 않음)
+        result = await orch.ainvoke(
+            {"messages": [HumanMessage(content=req.message.question)]}, cfg
+        )
 
     reply = result["__interrupt__"][0].value
     print(f"[서버 → CLIENT] message={reply}")
@@ -95,6 +92,22 @@ async def device_event(req: EventRequest):
         "thread_id": req.thread_id,
         "interrupt_preserved": bool(after.next),
         "history_len": len(after.values.get("messages", [])),
+    }
+
+
+@app.get("/history/{thread_id}")
+async def get_history(thread_id: str):
+    """checkpoint 에 저장된 대화 히스토리를 그대로 보여준다(검증용)."""
+    cfg = {"configurable": {"thread_id": thread_id}}
+    snap = await app.state.orchestrator.aget_state(cfg)
+    msgs = snap.values.get("messages", [])
+    return {
+        "thread_id": thread_id,
+        "interrupt_waiting": bool(snap.next),  # interrupt 대기 중인지
+        "count": len(msgs),
+        "messages": [
+            {"type": type(m).__name__, "content": m.content} for m in msgs
+        ],
     }
 
 
